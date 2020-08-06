@@ -1,36 +1,77 @@
+use minitrace::{Properties, Span, State, TraceDetails};
+use rand::prelude::*;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 mod zigzag;
 
-enum SpanRefKind {
-    ChildOf = 0,
-    FollowsFrom = 1,
+thread_local! {
+   static TRACE_ID_HIGH: i64 = random();
+   static TRACE_ID_LOW: RefCell<i64> = RefCell::new(0);
 }
 
-struct SpanRef {
-    kind: SpanRefKind,
-    trace_id_low: i64,
-    trace_id_high: i64,
-    span_id: i64,
+// return ([bytes], id -> &[bytes])
+fn reorder_properties(p: &Properties) -> (Vec<(u64, &[u8])>, HashMap<u64, (usize, usize)>) {
+    if p.span_ids.is_empty() || p.property_lens.is_empty() {
+        return (vec![], HashMap::new());
+    }
+    assert_eq!(p.span_ids.len(), p.property_lens.len());
+
+    let mut id_bytes_pairs = Vec::with_capacity(p.span_ids.len());
+    {
+        let mut remainder_bytes = p.payload.as_slice();
+        for (id, len) in p.span_ids.iter().zip(p.property_lens.iter()) {
+            let (bytes, remainder) = remainder_bytes.split_at(*len as _);
+            remainder_bytes = remainder;
+            id_bytes_pairs.push((*id, bytes));
+        }
+
+        id_bytes_pairs.sort_unstable_by_key(|s| s.0);
+    }
+
+    let mut id_to_bytes_slice = HashMap::with_capacity(id_bytes_pairs.len());
+    {
+        let mut current_id = id_bytes_pairs[0].0;
+        let mut current_index = 0;
+        let mut len = 0;
+
+        for (index, &(id, _)) in id_bytes_pairs.iter().enumerate() {
+            if id == current_id {
+                len += 1;
+            } else {
+                id_to_bytes_slice.insert(current_id, (current_index, len));
+
+                current_id = id;
+                current_index = index;
+                len = 1;
+            }
+        }
+        id_to_bytes_slice.insert(current_id, (current_index, len));
+    }
+
+    (id_bytes_pairs, id_to_bytes_slice)
 }
 
-struct Tag {
-    key: Vec<u8>,
-    value: Vec<u8>,
-}
+fn thrift_encode(
+    buf: &mut Vec<u8>,
+    service_name: &str,
+    TraceDetails {
+        start_time_ns,
+        cycles_per_second,
+        spans,
+        properties,
+        ..
+    }: &TraceDetails,
+    event_to_operation_name: impl Fn(&u32) -> String,
+) {
+    let trace_id_high = TRACE_ID_HIGH.with(|h| *h);
+    let trace_id_low = TRACE_ID_LOW.with(|l| {
+        *l.borrow_mut() += 1;
+        *l.borrow()
+    });
+    let (bytes_slices, id_to_bytes_slice) = reorder_properties(properties);
+    let start_time_us = *start_time_ns / 1_000;
 
-struct Span {
-    trace_id_low: i64,      // 1
-    trace_id_high: i64,     // 2
-    span_id: i64,           // 3
-    parent_span_id: i64,    // 4
-    operation_name: String, // 5
-    reference: SpanRef,     // 6
-    flags: i32,             // 7  `1` signifies a SAMPLED span, `2` signifies a DEBUG span.
-    start_time: i64,        // 8
-    duration: i64,          // 9
-    tags: Vec<Tag>,         // 10
-}
-
-fn encode(buf: &mut Vec<u8>, service_name: &str, spans: Vec<Span>) {
     // # thrift message header
     // ## protocal id
     // ```
@@ -68,8 +109,7 @@ fn encode(buf: &mut Vec<u8>, service_name: &str, spans: Vec<Span>) {
     //
     // ## process field header
     // ```
-    // const PROCESS_FIELD_ID: i16 = 1;
-    // const PROCESS_DELTA: u8 = PROCESS_FIELD_ID as u8;
+    // const PROCESS_DELTA: u8 = 1;
     // const STRUCT_TYPE: u8 = 12;
     // const PROCESS_TYPE: u8 = PROCESS_DELTA << 4 | STRUCT_TYPE;
     // buf.push(PROCESS_TYPE);
@@ -77,8 +117,7 @@ fn encode(buf: &mut Vec<u8>, service_name: &str, spans: Vec<Span>) {
     //
     // ## service name field header
     // ```
-    // const SERVICE_NAME_FIELD_ID: i16 = 1;
-    // const SERVICE_NAME_DELTA: u8 = SERVICE_NAME_FIELD_ID as u8;
+    // const SERVICE_NAME_DELTA: u8 = 1;
     // const BINARY_TYPE: u8 = 8;
     // const SERVICE_NAME_TYPE: u8 = SERVICE_NAME_DELTA << 4 | BINARY_TYPE;
     // buf.push(SERVICE_NAME_TYPE);
@@ -98,8 +137,7 @@ fn encode(buf: &mut Vec<u8>, service_name: &str, spans: Vec<Span>) {
     // spans field header
     //
     // ```
-    // const SPANS_FIELD_ID: i16 = 2;
-    // const SPANS_DELTA: u8 = (SPANS_FIELD_ID - 1) as u8;
+    // const SPANS_DELTA: u8 = 1;
     // const LIST_TYPE: u8 = 9;
     // const SPANS_TYPE: u8 = SPANS_DELTA << 4 | LIST_TYPE;
     // buf.push(SPANS_TYPE);
@@ -116,25 +154,22 @@ fn encode(buf: &mut Vec<u8>, service_name: &str, spans: Vec<Span>) {
         write_varint(buf, len as _);
     }
 
-    for Span {
-        trace_id_low,
-        trace_id_high,
-        span_id,
-        parent_span_id,
-        operation_name,
-        reference:
-            SpanRef {
-                kind: ref_kind,
-                trace_id_low: ref_trace_id_low,
-                trace_id_high: ref_trace_id_high,
-                span_id: ref_span_id,
-            },
-        flags,
-        start_time,
-        duration,
-        tags,
-    } in spans
-    {
+    let anchor_cycles = spans
+        .iter()
+        .find(|s| s.state == State::Root)
+        .expect("not contain root span")
+        .begin_cycles;
+
+    for span in spans {
+        let Span {
+            id,
+            state,
+            related_id,
+            begin_cycles,
+            elapsed_cycles,
+            event,
+        } = span;
+
         // trace id low field header
         // ```
         // const TRACE_ID_LOW_DELTA: i16 = 1;
@@ -151,7 +186,7 @@ fn encode(buf: &mut Vec<u8>, service_name: &str, spans: Vec<Span>) {
         // const TRACE_ID_HIGH_DELTA: i16 = 1;
         // const I64_TYPE: u8 = 6;
         // const TRACE_ID_HIGH_TYPE: u8 = (TRACE_ID_HIGH_DELTA << 4) as u8 | I64_TYPE;
-        // buf.push(TRACE_ID_HIGH_TYPE);
+        // buf.push(TRACE_ID_HIGH_TYPE);operation_name
         // ```
         buf.push(0x16);
         // trace id high data
@@ -166,7 +201,7 @@ fn encode(buf: &mut Vec<u8>, service_name: &str, spans: Vec<Span>) {
         // ```
         buf.push(0x16);
         // span id data
-        write_varint(buf, zigzag::from_i64(span_id));
+        write_varint(buf, zigzag::from_i64(*id as _));
 
         // parent span id field header
         // ```
@@ -174,10 +209,10 @@ fn encode(buf: &mut Vec<u8>, service_name: &str, spans: Vec<Span>) {
         // const I64_TYPE: u8 = 6;
         // const PARENT_SPAN_ID_TYPE: u8 = (PARENT_SPAN_ID_DELTA << 4) as u8 | I64_TYPE;
         // buf.push(PARENT_SPAN_ID_TYPE);
-        // ```
+        // ```property_lens
         buf.push(0x16);
         // parent span id data
-        write_varint(buf, zigzag::from_i64(parent_span_id));
+        write_varint(buf, zigzag::from_i64(*related_id as _));
 
         // operation name field header
         // ```
@@ -188,82 +223,116 @@ fn encode(buf: &mut Vec<u8>, service_name: &str, spans: Vec<Span>) {
         // ```
         buf.push(0x18);
         // operation name data
-        operation_name.as_bytes().encode(buf);
+        format!(
+            "{}{}",
+            event_to_operation_name(event),
+            match *state {
+                State::Root => " (Root spawning)",
+                State::Spawning => " (Spawning)",
+                State::Scheduling => " (Scheduling)",
+                _ => "",
+            }
+        )
+        .as_bytes()
+        .encode(buf);
 
-        // references field header
-        // ```
-        // const REFERENCES_DELTA: i16 = 1;
-        // const LIST_TYPE: u8 = 9;
-        // const REFERENCES_TYPE: u8 = (REFERENCES_DELTA << 4) as u8 | LIST_TYPE;
-        // buf.push(REFERENCES_TYPE);
-        // ```
-        buf.push(0x19);
-        // references list header
-        // NOTE: only one reference
-        // ```
-        // const STRUCT_TYPE: u8 = 12;
-        // let HEADER = (1 << 4) as u8 | STRUCT_TYPE as u8;
-        // buf.push(HEADER);
-        // ```
-        buf.push(0x1c);
-        // reference kind header
-        // ```
-        // const REF_KIND_DELTA: i16 = 1;
-        // const I32_TYPE: u8 = 5;
-        // const REF_KIND_TYPE: u8 = (REF_KIND_DELTA << 4) as u8 | I32_TYPE;
-        // ```
-        buf.push(0x15);
-        // reference kind data
-        write_varint(buf, zigzag::from_i32(ref_kind as _) as _);
-        // reference trace id low header
-        // ```
-        // const REF_TRACE_ID_LOW_DELTA: i16 = 1;
-        // const I64_TYPE: u8 = 6;
-        // const REF_TRACE_ID_LOW_TYPE: u8 = (REF_TRACE_ID_LOW_DELTA << 4) as u8 | I64_TYPE;
-        // ```
-        buf.push(0x16);
-        // reference trace id low data
-        write_varint(buf, zigzag::from_i64(ref_trace_id_low));
-        // reference trace id high header
-        // ```
-        // const REF_TRACE_ID_HIGH_DELTA: i16 = 1;
-        // const I64_TYPE: u8 = 6;
-        // const REF_TRACE_ID_HIGH_TYPE: u8 = (REF_TRACE_ID_HIGH_DELTA << 4) as u8 | I64_TYPE;
-        // ```
-        buf.push(0x16);
-        // reference trace id high data
-        write_varint(buf, zigzag::from_i64(ref_trace_id_high));
-        // reference span id header
-        // ```
-        // const SPAN_ID_HIGH_DELTA: i16 = 1;
-        // const I64_TYPE: u8 = 6;
-        // const SPAN_ID_HIGH_TYPE: u8 = (SPAN_ID_HIGH_DELTA << 4) as u8 | I64_TYPE;
-        // ```
-        buf.push(0x16);
-        // reference span id data
-        write_varint(buf, zigzag::from_i64(ref_span_id));
-        // reference struce tail
-        buf.push(0x00);
+        if *state != State::Root {
+            // references field header
+            // ```
+            // const REFERENCES_DELTA: i16 = 1;flags
+            // const LIST_TYPE: u8 = 9;
+            // const REFERENCES_TYPE: u8 = (REFERENCES_DELTA << 4) as u8 | LIST_TYPE;
+            // buf.push(REFERENCES_TYPE);
+            // ```
+            buf.push(0x19);
+            // references list header
+            // NOTE: only one reference
+            // ```
+            // const STRUCT_TYPE: u8 = 12;
+            // let HEADER = (1 << 4) as u8 | STRUCT_TYPE as u8;
+            // buf.push(HEADER);
+            // ```
+            buf.push(0x1c);
+            // reference kind header
+            // ```
+            // const REF_KIND_DELTA: i16 = 1;
+            // const I32_TYPE: u8 = 5;
+            // const REF_KIND_TYPE: u8 = (REF_KIND_DELTA << 4) as u8 | I32_TYPE;
+            // ```
+            buf.push(0x15);
+            // reference kind data
+            write_varint(
+                buf,
+                zigzag::from_i32(match state {
+                    State::Local => 0,      // Child of
+                    State::Spawning => 1,   // Follows from
+                    State::Scheduling => 1, // Follows from
+                    State::Settle => 1,     // Follows from
+                    State::Root => unreachable!(),
+                }) as _,
+            );
+            // reference trace id low header
+            // ```
+            // const REF_TRACE_ID_LOW_DELTA: i16 = 1;
+            // const I64_TYPE: u8 = 6;
+            // const REF_TRACE_ID_LOW_TYPE: u8 = (REF_TRACE_ID_LOW_DELTA << 4) as u8 | I64_TYPE;
+            // ```
+            buf.push(0x16);
+            // reference trace id low data
+            write_varint(buf, zigzag::from_i64(trace_id_low));
+            // reference trace id high header
+            // ```
+            // const REF_TRACE_ID_HIGH_DELTA: i16 = 1;
+            // const I64_TYPE: u8 = 6;
+            // const REF_TRACE_ID_HIGH_TYPE: u8 = (REF_TRACE_ID_HIGH_DELTA << 4) as u8 | I64_TYPE;
+            // ```
+            buf.push(0x16);
+            // reference trace id high data
+            write_varint(buf, zigzag::from_i64(trace_id_high));
+            // reference span id header
+            // ```
+            // const SPAN_ID_HIGH_DELTA: i16 = 1;
+            // const I64_TYPE: u8 = 6;
+            // const SPAN_ID_HIGH_TYPE: u8 = (SPAN_ID_HIGH_DELTA << 4) as u8 property_lens
+            // ```
+            buf.push(0x16);
+            // reference span id data
+            write_varint(buf, zigzag::from_i64(*related_id as _));
+            // reference struce tail
+            buf.push(0x00);
+        }
 
         // flags header
+        //
+        // If it's Root, the references field is not set.
+        // Then, DELTA is 2.
+        //
         // ```
-        // const FLAGS_DELTA: i16 = 1;
+        // const FLAGS_DELTA: i16 = if *state != State::Root {1} else {2};
         // const I32_TYPE: u8 = 5;
         // const FLAGS_TYPE: u8 = (FLAGS_DELTA << 4) as u8 | I32_TYPE;
         // ```
-        buf.push(0x15);
-        // flags data
-        write_varint(buf, zigzag::from_i32(flags) as _);
+        if *state != State::Root {
+            buf.push(0x15);
+        } else {
+            buf.push(0x25);
+        }
+
+        // flags data, `1` signifies a SAMPLED span, `2` signifies a DEBUG span.
+        write_varint(buf, zigzag::from_i32(1) as _);
 
         // start time header
         // ```
         // const START_TIME_DELTA: i16 = 1;
-        // const I64_TYPE: u8 = 6;
-        // const START_TIME_TYPE: u8 = (START_TIME_DELTA << 4) as u8 | I64_TYPE;
-        // ```
+        // const I64_TYPE: u8 = 6;property_lens
         buf.push(0x16);
         // start time data
-        write_varint(buf, zigzag::from_i64(start_time));
+        let delta_cycles = begin_cycles - anchor_cycles;
+        let delta_us = delta_cycles as f64 / *cycles_per_second as f64 * 1_000_000.0;
+        write_varint(
+            buf,
+            zigzag::from_i64((start_time_us + delta_us as u64) as _),
+        );
 
         // duration header
         // ```
@@ -273,20 +342,18 @@ fn encode(buf: &mut Vec<u8>, service_name: &str, spans: Vec<Span>) {
         // ```
         buf.push(0x16);
         // duration data
-        write_varint(buf, zigzag::from_i64(duration));
+        let duration_us = *elapsed_cycles as f64 / *cycles_per_second as f64 * 1_000_000.0;
+        write_varint(buf, zigzag::from_i64(duration_us as _));
 
         // tags
-        if !tags.is_empty() {
+        if let Some((from, limit)) = id_to_bytes_slice.get(id) {
             // tags field header
             // ```
-            // const TAGS_DELTA: i16 = 1;
-            // const LIST_TYPE: u8 = 9;
-            // const TAGS_TYPE: u8 = (TAGS_DELTA << 4) as u8 | LIST_TYPE;
-            // buf.push(TAGS_TYPE);
+            // const TAGS_DELTA: i16 = 1;property_lens
             // ```
             buf.push(0x19);
             // tags list header
-            let len = tags.len();
+            let len = *limit;
             const STRUCT_TYPE: u8 = 12;
             if len < 15 {
                 buf.push((len << 4) as u8 | STRUCT_TYPE as u8);
@@ -295,7 +362,13 @@ fn encode(buf: &mut Vec<u8>, service_name: &str, spans: Vec<Span>) {
                 write_varint(buf, len as _);
             }
 
-            for Tag { key, value } in tags {
+            let bytes = &bytes_slices[*from..*from + *limit];
+
+            for (_, bytes) in bytes {
+                let mut split = bytes.splitn(2, |b| *b == b':');
+                let key = split.next().unwrap_or(&[]);
+                let value = split.next().unwrap_or(&[]);
+
                 // key field header
                 // ```
                 // const KEY_DELTA: i16 = 1;
@@ -303,8 +376,8 @@ fn encode(buf: &mut Vec<u8>, service_name: &str, spans: Vec<Span>) {
                 // const KEY_TYPE: u8 = (KEY_DELTA << 4) as u8 | BYTES_TYPE;
                 // ```
                 buf.push(0x18);
-                // key data
-                key.as_slice().encode(buf);
+                // key dataproperty_lens
+                key.encode(buf);
 
                 // type field header
                 // ```
@@ -324,7 +397,7 @@ fn encode(buf: &mut Vec<u8>, service_name: &str, spans: Vec<Span>) {
                 // ```
                 buf.push(0x18);
                 // value data
-                value.as_slice().encode(buf);
+                value.encode(buf);
 
                 // tag struct tail
                 buf.push(0x00);
@@ -372,56 +445,40 @@ mod tests {
 
     #[test]
     fn test_name() {
-        let mut buf = vec![];
-        encode(
-            &mut buf,
-            "minitrace_demo",
-            vec![
-                Span {
-                    trace_id_low: 10,
-                    trace_id_high: 20,
-                    span_id: 30,
-                    parent_span_id: 2000,
-                    operation_name: "22".into(),
-                    reference: SpanRef {
-                        kind: SpanRefKind::ChildOf,
-                        trace_id_low: 80,
-                        trace_id_high: 40,
-                        span_id: 0,
-                    },
-                    flags: 1,
-                    start_time: 606060606,
-                    duration: 30303030,
-                    tags: vec![
-                        Tag {
-                            key: "abc".into(),
-                            value: "efg".into(),
-                        },
-                        Tag {
-                            key: "13579".into(),
-                            value: "24680".into(),
-                        },
-                    ],
-                },
-                Span {
-                    trace_id_low: 498465402135,
-                    trace_id_high: 89765413645,
-                    span_id: 514213548979,
-                    parent_span_id: 5454564654,
-                    operation_name: "226545sdfslf".into(),
-                    reference: SpanRef {
-                        kind: SpanRefKind::FollowsFrom,
-                        trace_id_low: 35465432,
-                        trace_id_high: 5468748964,
-                        span_id: 564654,
-                    },
-                    flags: 2,
-                    start_time: 82374287346238,
-                    duration: 34897238974234,
-                    tags: vec![],
-                },
-            ],
-        );
-        println!("{}", hex::encode(buf));
+        let res = {
+            let (_g, collector) = minitrace::trace_enable(0u32);
+            minitrace::property(b"state:begin");
+
+            std::thread::sleep(std::time::Duration::from_millis(20));
+
+            {
+                let _g = minitrace::new_span(1u32);
+                minitrace::property(b"where:in child");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            minitrace::property(b"state:end");
+            collector
+        }
+        .collect();
+
+        let mut buf = Vec::with_capacity(1024);
+        thrift_encode(&mut buf, "mmmmini".into(), &res, |s| {
+            if *s == 0 {
+                "Parent".into()
+            } else {
+                "Child".into()
+            }
+        });
+
+        let agent = std::net::SocketAddr::from(([127, 0, 0, 1], 6831));
+
+        let socket = std::net::UdpSocket::bind(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+            0,
+        ))
+        .unwrap();
+
+        socket.send_to(&buf, agent).unwrap();
     }
 }

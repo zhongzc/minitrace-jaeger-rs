@@ -5,7 +5,8 @@ authors = ["zhongzc <zhongzc_arch@outlook.com>"]
 edition = "2018"
 
 [dependencies]
-
+minitrace = { git = "https://github.com/pingcap-incubator/minitrace-rust.git" }
+rand = "0.7"
 
 [dev-dependencies]
 hex = "0.4.2"
