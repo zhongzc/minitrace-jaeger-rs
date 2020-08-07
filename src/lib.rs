@@ -52,7 +52,7 @@ fn reorder_properties(p: &Properties) -> (Vec<(u64, &[u8])>, HashMap<u64, (usize
     (id_bytes_pairs, id_to_bytes_slice)
 }
 
-fn thrift_encode(
+pub fn thrift_encode(
     buf: &mut Vec<u8>,
     service_name: &str,
     TraceDetails {
@@ -444,26 +444,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_name() {
+    fn it_work() {
         let res = {
             let (_g, collector) = minitrace::trace_enable(0u32);
-            minitrace::property(b"state:begin");
+            minitrace::property(b"test property:a root span");
 
             std::thread::sleep(std::time::Duration::from_millis(20));
 
             {
                 let _g = minitrace::new_span(1u32);
-                minitrace::property(b"where:in child");
+                minitrace::property(b"where am i:in child");
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
-            minitrace::property(b"state:end");
+            minitrace::property(b"another test property:done");
             collector
         }
         .collect();
 
         let mut buf = Vec::with_capacity(1024);
-        thrift_encode(&mut buf, "mmmmini".into(), &res, |s| {
+        thrift_encode(&mut buf, "test_minitrace".into(), &res, |s| {
             if *s == 0 {
                 "Parent".into()
             } else {
